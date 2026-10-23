@@ -8,6 +8,6 @@ class Settings(BaseSettings):
     llm_model: str = "gpt-4o-mini"
 
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
-
+    database_url: str = "postgresql+psycopg://postgres:postgres@localhost:5432/adaptai"
 
 settings = Settings()
