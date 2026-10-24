@@ -27,7 +27,7 @@ def load_history(db: Session, conversation_id: int) -> list[dict]:
         .limit(HISTORY_LIMIT)
         .all()
     )
-    rows.reverse()  # oldest first
+    rows.reverse()  
     return [{"role": m.role, "content": m.content} for m in rows]
 
 
