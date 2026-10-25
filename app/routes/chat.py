@@ -1,8 +1,9 @@
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
 from sqlalchemy.orm import Session
 
 from app.db import get_db
 from app.llm import LLMClient
+from app.memory import MemoryService, get_memory_service
 from app.models import Conversation, Message
 from app.schemas import ChatRequest, ChatResponse
 
@@ -19,6 +20,18 @@ def get_llm() -> LLMClient:
     return LLMClient()
 
 
+def build_system_prompt(memories: list[str]) -> str:
+    if not memories:
+        return SYSTEM_PROMPT
+    facts = "\n".join(f"- {m}" for m in memories)
+    return (
+        f"{SYSTEM_PROMPT}\n\n"
+        "Facts remembered about this user from earlier conversations "
+        "(use them naturally when relevant, and do not recite them):\n"
+        f"{facts}"
+    )
+
+
 def load_history(db: Session, conversation_id: int) -> list[dict]:
     rows = (
         db.query(Message)
@@ -27,15 +40,17 @@ def load_history(db: Session, conversation_id: int) -> list[dict]:
         .limit(HISTORY_LIMIT)
         .all()
     )
-    rows.reverse()  
+    rows.reverse()  # oldest first
     return [{"role": m.role, "content": m.content} for m in rows]
 
 
 @router.post("/chat", response_model=ChatResponse)
 def chat(
     req: ChatRequest,
+    background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
     llm: LLMClient = Depends(get_llm),
+    memory: MemoryService = Depends(get_memory_service),
 ):
     if req.conversation_id is None:
         conversation = Conversation(user_id=req.user_id)
@@ -46,8 +61,9 @@ def chat(
             raise HTTPException(status_code=404, detail="Conversation not found")
         history = load_history(db, conversation.id)
 
+    memories = memory.search(req.user_id, req.message)
     messages = (
-        [{"role": "system", "content": SYSTEM_PROMPT}]
+        [{"role": "system", "content": build_system_prompt(memories)}]
         + history
         + [{"role": "user", "content": req.message}]
     )
@@ -58,4 +74,12 @@ def chat(
     db.add(conversation)
     db.commit()
 
+    background_tasks.add_task(
+        memory.add,
+        req.user_id,
+        [
+            {"role": "user", "content": req.message},
+            {"role": "assistant", "content": reply},
+        ],
+    )
     return ChatResponse(reply=reply, conversation_id=conversation.id)

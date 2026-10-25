@@ -1,55 +1,11 @@
-import pytest
-from fastapi.testclient import TestClient
-from sqlalchemy import create_engine
-from sqlalchemy.orm import sessionmaker
-from sqlalchemy.pool import StaticPool
-
-from app.db import Base, get_db
 from app.llm import LLMError
 from app.main import app
 from app.routes.chat import get_llm
 
 
-class FakeLLM:
-    def __init__(self):
-        self.calls = []
-
-    def chat(self, messages):
-        self.calls.append(messages)
-        return "fake reply"
-
-
 class BrokenLLM:
     def chat(self, messages):
         raise LLMError("boom")
-
-
-@pytest.fixture
-def fake_llm():
-    return FakeLLM()
-
-
-@pytest.fixture
-def client(fake_llm):
-    engine = create_engine(
-        "sqlite://",
-        connect_args={"check_same_thread": False},
-        poolclass=StaticPool,
-    )
-    Base.metadata.create_all(engine)
-    TestingSession = sessionmaker(bind=engine, autoflush=False, expire_on_commit=False)
-
-    def override_db():
-        db = TestingSession()
-        try:
-            yield db
-        finally:
-            db.close()
-
-    app.dependency_overrides[get_db] = override_db
-    app.dependency_overrides[get_llm] = lambda: fake_llm
-    yield TestClient(app)
-    app.dependency_overrides.clear()
 
 
 def test_new_chat_returns_reply_and_conversation_id(client):
@@ -97,7 +53,34 @@ def test_empty_message_rejected(client):
     assert r.status_code == 422
 
 
-def test_llm_failure_returns_502(client):
+def test_llm_failure_returns_502_and_stores_no_memory(client, fake_memory):
     app.dependency_overrides[get_llm] = lambda: BrokenLLM()
     r = client.post("/chat", json={"user_id": "u1", "message": "hi"})
     assert r.status_code == 502
+    assert fake_memory.added == []
+
+
+def test_memories_are_added_to_system_prompt(client, fake_llm):
+    client.post("/chat", json={"user_id": "u1", "message": "plan my weekend"})
+    system = fake_llm.calls[0][0]
+    assert system["role"] == "system"
+    assert "Likes hiking" in system["content"]
+
+
+def test_no_memories_uses_plain_system_prompt(client, fake_llm, fake_memory):
+    fake_memory.facts = []
+    client.post("/chat", json={"user_id": "u1", "message": "hi"})
+    assert "Facts remembered" not in fake_llm.calls[0][0]["content"]
+
+
+def test_exchange_is_saved_to_memory_after_reply(client, fake_memory):
+    client.post("/chat", json={"user_id": "u1", "message": "I love tea"})
+    assert fake_memory.added == [
+        (
+            "u1",
+            [
+                {"role": "user", "content": "I love tea"},
+                {"role": "assistant", "content": "fake reply"},
+            ],
+        )
+    ]
